@@ -1,0 +1,198 @@
+name: Build SymCC artifact
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-artifact:
+    runs-on: ubuntu-24.04
+    env:
+      LLVM_VERSION: "18"
+    steps:
+      - name: Check out repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cargo \
+            clang-${LLVM_VERSION} \
+            cmake \
+            git \
+            libz3-dev \
+            llvm-${LLVM_VERSION} \
+            llvm-${LLVM_VERSION}-dev \
+            llvm-${LLVM_VERSION}-tools \
+            ninja-build \
+            python3-pip \
+            zlib1g-dev
+          python3 -m pip install --user --upgrade lit
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Configure SymCC (QSYM backend)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Ubuntu packages may place LLVMConfig.cmake in different locations.
+          llvm_dir_candidates=(
+            "/usr/lib/llvm-${LLVM_VERSION}/lib/cmake/llvm"
+            "/usr/lib/llvm-${LLVM_VERSION}/cmake"
+          )
+
+          llvm_dir=""
+          for candidate in "${llvm_dir_candidates[@]}"; do
+            if [[ -f "${candidate}/LLVMConfig.cmake" ]]; then
+              llvm_dir="${candidate}"
+              break
+            fi
+          done
+
+          if [[ -z "${llvm_dir}" ]]; then
+            echo "::error::Could not locate LLVMConfig.cmake for LLVM ${LLVM_VERSION}." >&2
+            exit 1
+          fi
+
+          cmake -G Ninja \
+            -S . \
+            -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-${LLVM_VERSION} \
+            -DCMAKE_CXX_COMPILER=clang++-${LLVM_VERSION} \
+            -DLLVM_VERSION=${LLVM_VERSION} \
+            -DLLVM_DIR="${llvm_dir}" \
+            -DSYMCC_RT_BACKEND=qsym \
+            -DZ3_TRUST_SYSTEM_VERSION=ON
+
+      - name: Build SymCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          ninja -C build
+
+      - name: Run tests (ninja check)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ninja -C build -t targets all | grep -Eq '^check(:|$)'; then
+            ninja -C build check
+          else
+            echo "::error::Expected Ninja target 'check' is unavailable in this build environment." >&2
+            exit 1
+          fi
+
+      - name: Package relocatable artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          commit_short="${GITHUB_SHA::12}"
+          package_root="symcc-linux-llvm${LLVM_VERSION}-${commit_short}"
+          staging_dir="${RUNNER_TEMP}/${package_root}"
+
+          runtime_build_dir="$(find build -type d -path '*/SymCCRuntime-prefix/src/SymCCRuntime-build' -print -quit || true)"
+          if [[ -z "${runtime_build_dir}" ]]; then
+            echo "::error::Could not locate SymCC runtime build directory." >&2
+            exit 1
+          fi
+
+          mkdir -p "${staging_dir}/bin" "${staging_dir}/lib/pass" "${staging_dir}/lib/runtime" "${staging_dir}/libexec"
+
+          cp "build/symcc" "${staging_dir}/libexec/symcc.real"
+          cp "build/sym++" "${staging_dir}/libexec/sympp.real"
+          cp "build/libsymcc.so" "${staging_dir}/lib/pass/libsymcc.so"
+
+          mapfile -t runtime_libs < <(find "${runtime_build_dir}" -maxdepth 1 -type f -name 'libsymcc-rt*' -print)
+          if [[ "${#runtime_libs[@]}" -eq 0 ]]; then
+            echo "::error::No runtime libraries matching libsymcc-rt* were found." >&2
+            exit 1
+          fi
+          cp "${runtime_libs[@]}" "${staging_dir}/lib/runtime/"
+
+          cat > "${staging_dir}/bin/symcc" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          prefix_dir="$(cd -- "${script_dir}/.." && pwd)"
+          export SYMCC_RUNTIME_DIR="${SYMCC_RUNTIME_DIR:-${prefix_dir}/lib/runtime}"
+          export SYMCC_PASS_DIR="${SYMCC_PASS_DIR:-${prefix_dir}/lib/pass}"
+          export SYMCC_CLANG="${SYMCC_CLANG:-clang-18}"
+          exec "${prefix_dir}/libexec/symcc.real" "$@"
+          EOF
+
+          cat > "${staging_dir}/bin/sym++" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          prefix_dir="$(cd -- "${script_dir}/.." && pwd)"
+          export SYMCC_RUNTIME_DIR="${SYMCC_RUNTIME_DIR:-${prefix_dir}/lib/runtime}"
+          export SYMCC_PASS_DIR="${SYMCC_PASS_DIR:-${prefix_dir}/lib/pass}"
+          export SYMCC_CLANGPP="${SYMCC_CLANGPP:-clang++-18}"
+          # Use the host's standard C++ library by default; override if needed.
+          if [[ -z "${SYMCC_LIBCXX_PATH:-}" && -z "${SYMCC_REGULAR_LIBCXX:-}" ]]; then
+            export SYMCC_REGULAR_LIBCXX=1
+          fi
+          exec "${prefix_dir}/libexec/sympp.real" "$@"
+          EOF
+
+          chmod +x "${staging_dir}/bin/symcc" "${staging_dir}/bin/sym++" "${staging_dir}/libexec/symcc.real" "${staging_dir}/libexec/sympp.real"
+
+          cat > "${staging_dir}/README.txt" <<EOF
+          SymCC artifact for Linux (built on GitHub Actions Ubuntu runner)
+          ===============================================================
+
+          Contents:
+          - bin/symcc and bin/sym++: relocatable launchers
+          - lib/pass/libsymcc.so: SymCC LLVM pass module
+          - lib/runtime/libsymcc-rt*: SymCC runtime libraries
+
+          Usage:
+          1) Extract the archive and add <extract-dir>/${package_root}/bin to PATH.
+          2) Ensure compatible host dependencies are installed (for this build: LLVM/Clang ${LLVM_VERSION}, libz3, standard C/C++ runtime libs).
+          3) Compile with:
+               symcc your_file.c -o your_program
+               sym++ your_file.cpp -o your_program
+
+          Notes:
+          - This package is relocatable inside the extracted directory.
+          - It is not a statically portable bundle of Ubuntu system libraries.
+          - You can override tool paths with SYMCC_CLANG/SYMCC_CLANGPP and runtime/pass paths with
+            SYMCC_RUNTIME_DIR and SYMCC_PASS_DIR.
+          EOF
+
+          build_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          llvm_config_path="$(clang-${LLVM_VERSION} -print-file-name=libclang.so 2>/dev/null || true)"
+          cat > "${staging_dir}/BUILD-MANIFEST.txt" <<EOF
+          commit=${GITHUB_SHA}
+          llvm_version=${LLVM_VERSION}
+          clang_version=$(clang-${LLVM_VERSION} --version | head -n 1)
+          llvm_config_probe=${llvm_config_path}
+          runner_os=${RUNNER_OS}
+          runner_arch=${RUNNER_ARCH}
+          uname_machine=$(uname -m)
+          build_date_utc=${build_date}
+          EOF
+
+          tarball_name="${package_root}.tar.gz"
+          tar -C "${RUNNER_TEMP}" -czf "${tarball_name}" "${package_root}"
+          sha256sum "${tarball_name}" > "${tarball_name}.sha256"
+
+          mv "${tarball_name}" .
+          mv "${tarball_name}.sha256" .
+
+      - name: Upload artifact archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: symcc-linux-cachyos-llvm18
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+          if-no-files-found: error
